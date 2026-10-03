@@ -1241,7 +1241,6 @@ static void SetSafetyNetProps() {
         {"vendor.boot.vbmeta.device_state", "locked"},
         {"vendor.boot.verifiedbootstate", "green"},
         {"oplusboot.verifiedbootstate", "green"},
-        {"sys.oem_unlock_allowed", "0"},
         {"ro.oem_unlock_supported", "0"},
         {"ro.crypto.state", "encrypted"},
         {"ro.is_ever_orange", "0"},
@@ -1486,6 +1485,10 @@ void PropertyLoadBootDefaults() {
         }
     }
 
+    // ro.* is write-once. The kernel cmdline has already set the boot properties,
+    // so the overrides below have to run while that restriction is lifted.
+    weaken_prop_override_security = true;
+
     // Update with vendor-specific property runtime overrides
     vendor_load_properties();
 
@@ -1494,10 +1497,6 @@ void PropertyLoadBootDefaults() {
     property_initialize_ro_cpu_abilist();
     property_initialize_ro_vendor_api_level();
 
-    // Report a valid verified boot chain to make Google SafetyNet integrity
-    // checks pass. This needs to be done before parsing the kernel cmdline as
-    // these properties are read-only and will be set to invalid values with
-    // androidboot cmdline arguments.
     if (SPOOF_SAFETYNET) {
       if (!IsRecoveryMode()) {
         SetSafetyNetProps();
@@ -1505,6 +1504,8 @@ void PropertyLoadBootDefaults() {
     }
 
     LoadReleaseBuildProperties();
+
+    weaken_prop_override_security = false;
 
     update_sys_usb_config();
 }
