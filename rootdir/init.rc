@@ -1127,13 +1127,6 @@ on post-fs-data
     # Update dm-verity state and set partition.*.verified properties.
     verity_update_state
 
-on early-init && property:persist.sys.spoof.migrated=
-    setprop persist.sys.spoof.migrated 0
-
-on post-fs-data && property:persist.sys.spoof.migrated=0
-    exec - root root -- /system/bin/rm -rf /data/adb/tricky_store /data/adb/playintegrityfix /data/adb/.custom_rom_hide_allowlist
-    setprop persist.sys.spoof.migrated 1
-
 on property:vold.checkpoint_committed=1
     trigger post-fs-data-checkpointed
 

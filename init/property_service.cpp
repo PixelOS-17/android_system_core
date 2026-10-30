@@ -404,9 +404,8 @@ static std::optional<uint32_t> PropertySet(const std::string& name, const std::s
     } else {
         prop_info* pi = (prop_info*)__system_property_find(name.c_str());
         if (pi != nullptr) {
-            // ro.* properties are actually "write-once", unless the system decides to
-            if (StartsWith(name, "ro.") && !weaken_prop_override_security &&
-                    !StartsWith(name, "ro.boot.vbmeta.")) {
+            // ro.* properties are actually "write-once", unless init is overriding them
+            if (StartsWith(name, "ro.") && !weaken_prop_override_security) {
                 *error = "Read-only property was already set";
                 return {PROP_ERROR_READ_ONLY_PROPERTY};
             }
@@ -503,20 +502,6 @@ bool CheckControlPropertyPerms(const std::string& name, const std::string& value
     return CheckMacPerms(control_string_full, target_context_full, source_context.c_str(), cr);
 }
 
-static bool is_exempt(const std::string& name, const std::string& source_context) {
-    static const std::vector<std::string> exemption_list = {
-        "persist.sys.",
-        "logpersistd",
-        "ro.boot.vbmeta.",
-    };
-
-    return std::any_of(exemption_list.begin(), exemption_list.end(),
-        [&](const std::string& exempt) {
-            return name.find(exempt) != std::string::npos ||
-                   source_context.find(exempt) != std::string::npos;
-        });
-}
-
 // This returns one of the enum of PROP_SUCCESS or PROP_ERROR*.
 uint32_t CheckPermissions(const std::string& name, const std::string& value,
                           const std::string& source_context, const ucred& cr, std::string* error) {
@@ -539,7 +524,7 @@ uint32_t CheckPermissions(const std::string& name, const std::string& value,
     const char* type = nullptr;
     property_info_area->GetPropertyInfo(name.c_str(), &target_context, &type);
 
-    if (!is_exempt(name, source_context) && !CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
+    if (!CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
         // Info about contexts are available also in the selinux denials in the kernel message,
         // but they may be suppressed by the ratelimiter, in which case this log from init can be
         // helpful.
@@ -1173,44 +1158,38 @@ static void property_initialize_ro_vendor_api_level() {
     }
 }
 
-static std::string GetVbmetaSize() {
-    std::string suffix = android::base::GetProperty("ro.boot.slot_suffix", "");
-    if (suffix.empty()) {
-        LOG(INFO) << "GetVbmetaSize: ro.boot.slot_suffix is empty";
+static void OverrideProperty(const std::string& name, const std::string& value) {
+    std::string error;
+    uint32_t res = PropertySetNoSocket(name, value, &error);
+    if (res != PROP_SUCCESS) {
+        LOG(ERROR) << "Failed to override " << name << " with '" << value << "': " << error
+                   << " (" << res << ")";
     }
-    
-    std::string path = "/dev/block/by-name/vbmeta" + suffix;
-    LOG(INFO) << "GetVbmetaSize: Attempting to open " << path;
-    
-    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+}
+
+static std::string GetVbmetaSize() {
+    std::string path = "/dev/block/by-name/vbmeta" +
+                       android::base::GetProperty("ro.boot.slot_suffix", "");
+    android::base::unique_fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
     if (fd < 0) {
-        LOG(ERROR) << "GetVbmetaSize: Failed to open " << path << ": " << strerror(errno);
+        PLOG(ERROR) << "Failed to open " << path;
         return "";
     }
-    
+
     uint64_t size = 0;
-    if (ioctl(fd, BLKGETSIZE64, &size) < 0) {
-        LOG(ERROR) << "GetVbmetaSize: ioctl(BLKGETSIZE64) failed for " << path << ": " << strerror(errno);
-        off_t seek_size = lseek(fd, 0, SEEK_END);
+    if (ioctl(fd.get(), BLKGETSIZE64, &size) < 0) {
+        off_t seek_size = lseek(fd.get(), 0, SEEK_END);
         if (seek_size < 0) {
-            LOG(ERROR) << "GetVbmetaSize: lseek failed for " << path << ": " << strerror(errno);
-            close(fd);
+            PLOG(ERROR) << "Failed to get size of " << path;
             return "";
         }
         size = static_cast<uint64_t>(seek_size);
     }
-    
-    close(fd);
-    
-    LOG(INFO) << "GetVbmetaSize: Size of " << path << ": " << size;
     return std::to_string(size);
 }
 
 static void SetSafetyNetProps() {
-    std::string error;
-    uint32_t res;
-
-    const std::pair<const char*, const char*> props[] = {
+    static const std::pair<const char*, const char*> props[] = {
         {"ro.boot.flash.locked", "1"},
         {"ro.boot.vbmeta.device_state", "locked"},
         {"ro.boot.vbmeta.hash_alg", "sha256"},
@@ -1247,25 +1226,20 @@ static void SetSafetyNetProps() {
         {"ro.secureboot.devicelock", "1"},
         {"ro.secureboot.lockstate", "locked"},
 #ifdef SPOOF_FIRST_API_LEVEL_32
-        {"ro.product.first_api_level", "32"}
+        {"ro.product.first_api_level", "32"},
 #endif
     };
 
     for (const auto& [name, value] : props) {
-        res = PropertySetNoSocket(name, value, &error);
-        if (res == PROP_SUCCESS) {
-            LOG(INFO) << "Property '" << name << "' set successfully to '" << value << "'";
-        } else {
-            LOG(ERROR) << "Failed to set property '" << name
-                       << "' to '" << value << "': err=" << res << " (" << error << ")";
-        }
+        OverrideProperty(name, value);
     }
 }
 
 static std::string GenerateFallbackDigest() {
     std::string seed = android::base::GetProperty("ro.build.id", "unknown") + "-" +
-                       android::base::GetProperty("ro.build.version.incremental", "unknown") + "-vbmeta";
-    
+                       android::base::GetProperty("ro.build.version.incremental", "unknown") +
+                       "-vbmeta";
+
     std::string result;
     std::hash<std::string> hasher;
     for (int i = 0; i < 8; i++) {
@@ -1277,116 +1251,54 @@ static std::string GenerateFallbackDigest() {
     return result;
 }
 
-void LoadVbMetaOverrides() {
-    uint32_t res;
-    std::string error;
-    std::string vbmeta_size = GetVbmetaSize();
-    
-    if (vbmeta_size.empty()) {
-        vbmeta_size = "4096";
+static void LoadVbMetaOverrides() {
+    if (android::base::GetProperty("ro.boot.vbmeta.size", "").empty()) {
+        std::string vbmeta_size = GetVbmetaSize();
+        if (vbmeta_size.empty()) {
+            vbmeta_size = "4096";
+        }
+        OverrideProperty("ro.boot.vbmeta.size", vbmeta_size);
     }
 
-    std::string vbmeta_size_prop = android::base::GetProperty("ro.boot.vbmeta.size", "");
-    if (vbmeta_size_prop.empty()) {
-        res = PropertySetNoSocket("ro.boot.vbmeta.size", vbmeta_size, &error);
-        if (res == PROP_SUCCESS) {
-            LOG(INFO) << "GetVbmetaSize: Property 'ro.boot.vbmeta.size' set successfully to '" << vbmeta_size << "'";
-        } else {
-            LOG(ERROR) << "GetVbmetaSize: Failed to set property 'ro.boot.vbmeta.size' to '" << vbmeta_size
-                       << "': err=" << res << " (" << error << ")";
-        }
-    }
-
-    std::string vbmeta_digest = android::base::GetProperty("ro.boot.vbmeta.digest", "");
-    if (vbmeta_digest.empty()) {
-        std::string fallback_digest = GenerateFallbackDigest();
-        res = PropertySetNoSocket("ro.boot.vbmeta.digest", fallback_digest, &error);
-        if (res == PROP_SUCCESS) {
-            LOG(INFO) << "GetVbmetaDigest: Property 'ro.boot.vbmeta.digest' set successfully to dynamic fallback value '" << fallback_digest << "'";
-        } else {
-            LOG(ERROR) << "GetVbmetaDigest: Failed to set property 'ro.boot.vbmeta.digest' to fallback value: " << error;
-        }
+    if (android::base::GetProperty("ro.boot.vbmeta.digest", "").empty()) {
+        OverrideProperty("ro.boot.vbmeta.digest", GenerateFallbackDigest());
     }
 }
 
-void LoadDebugProperties() {
-    const char* DEBUG_PROP = "persist.sys.debug_enabled";
-    std::string error;
-    uint32_t res;
-
-    std::string debug_value = GetProperty(DEBUG_PROP, "0");
-    bool debug_enabled = debug_value == "1";
-    LOG(INFO) << DEBUG_PROP << " = " << debug_value;
-
-    const std::pair<const char*, const char*> debug_props[] = {
-        {"service.adb.root", debug_enabled ? "1" : "0"},
-        {"ro.adb.secure", debug_enabled ? "0" : "1"},
-        {"ro.debuggable", debug_enabled ? "1" : "0"},
-        {"ro.force.debuggable", debug_enabled ? "1" : "0"}
-    };
-
-    for (const auto& [name, value] : debug_props) {
-        res = PropertySetNoSocket(name, value, &error);
-        if (res == PROP_SUCCESS) {
-            LOG(INFO) << "Debug property '" << name << "' set to '" << value << "'";
-        } else {
-            LOG(ERROR) << "Failed to set debug property '" << name
-                       << "' to '" << value << "': err=" << res << " (" << error << ")";
-        }
+static void LoadDebugProperties() {
+    const bool debug_enabled = android::base::GetBoolProperty("persist.sys.debug_enabled", false);
+    if (debug_enabled) {
+        LOG(INFO) << "persist.sys.debug_enabled is set, enabling adb root";
     }
+
+    OverrideProperty("service.adb.root", debug_enabled ? "1" : "0");
+    OverrideProperty("ro.debuggable", debug_enabled ? "1" : "0");
+    OverrideProperty("ro.force.debuggable", debug_enabled ? "1" : "0");
 }
 
-void LoadReleaseBuildProperties() {
-    std::string error;
-    uint32_t res;
-
-    const char* FLAVOR_PROP = "ro.build.flavor";
-    std::string flavor_value = GetProperty(FLAVOR_PROP, "");
-
-    if (!flavor_value.empty()) {
-        if (flavor_value.find("lineage_") == 0) {
-            flavor_value.erase(0, std::string("lineage_").length());
-        } else if (flavor_value.find("pixelos_") == 0) {
-            flavor_value.erase(0, std::string("pixelos_").length());
-        }
-
-        size_t pos = flavor_value.find("userdebug");
-        if (pos != std::string::npos) {
-            flavor_value.replace(pos, std::string("userdebug").length(), "user");
-        }
-
-        res = PropertySetNoSocket(FLAVOR_PROP, flavor_value, &error);
-        if (res == PROP_SUCCESS) {
-            LOG(INFO) << "Property '" << FLAVOR_PROP << "' set to '" << flavor_value << "'";
-        } else {
-            LOG(ERROR) << "Failed to set property '" << FLAVOR_PROP
-                       << "' to '" << flavor_value << "': err=" << res << " (" << error << ")";
-        }
-    }
-
-    const char* DISPLAY_ID_PROP = "ro.build.display.id";
-    std::string display_id = GetProperty(DISPLAY_ID_PROP, "");
-
-    if (!display_id.empty()) {
-        std::istringstream iss(display_id);
-        std::string token;
-        std::string numeric_build;
-
-        while (iss >> token) {
-            if (token.find('.') != std::string::npos && std::any_of(token.begin(), token.end(), ::isdigit)) {
-                numeric_build = token;
+static void LoadReleaseBuildProperties() {
+    std::string flavor = android::base::GetProperty("ro.build.flavor", "");
+    if (!flavor.empty()) {
+        for (const char* prefix : {"lineage_", "pixelos_"}) {
+            if (StartsWith(flavor, prefix)) {
+                flavor.erase(0, strlen(prefix));
                 break;
             }
         }
+        size_t pos = flavor.find("userdebug");
+        if (pos != std::string::npos) {
+            flavor.replace(pos, std::string("userdebug").length(), "user");
+        }
+        OverrideProperty("ro.build.flavor", flavor);
+    }
 
-        if (!numeric_build.empty()) {
-            res = PropertySetNoSocket(DISPLAY_ID_PROP, numeric_build, &error);
-            if (res == PROP_SUCCESS) {
-                LOG(INFO) << "Property '" << DISPLAY_ID_PROP << "' set to '" << numeric_build << "'";
-            } else {
-                LOG(ERROR) << "Failed to set property '" << DISPLAY_ID_PROP
-                           << "' to '" << numeric_build << "': err=" << res << " (" << error << ")";
-            }
+    std::istringstream display_id(android::base::GetProperty("ro.build.display.id", ""));
+    std::string token;
+    while (display_id >> token) {
+        if (token.find('.') != std::string::npos &&
+            std::any_of(token.begin(), token.end(), ::isdigit)) {
+            OverrideProperty("ro.build.display.id", token);
+            break;
         }
     }
 }
