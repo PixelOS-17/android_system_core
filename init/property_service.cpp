@@ -1306,7 +1306,6 @@ void LoadDebugProperties() {
 
     const std::pair<const char*, const char*> debug_props[] = {
         {"service.adb.root", debug_enabled ? "1" : "0"},
-        {"ro.adb.secure", debug_enabled ? "0" : "1"},
         {"ro.debuggable", debug_enabled ? "1" : "0"},
         {"ro.force.debuggable", debug_enabled ? "1" : "0"}
     };
