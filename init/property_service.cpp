@@ -503,20 +503,6 @@ bool CheckControlPropertyPerms(const std::string& name, const std::string& value
     return CheckMacPerms(control_string_full, target_context_full, source_context.c_str(), cr);
 }
 
-static bool is_exempt(const std::string& name, const std::string& source_context) {
-    static const std::vector<std::string> exemption_list = {
-        "persist.sys.",
-        "logpersistd",
-        "ro.boot.vbmeta.",
-    };
-
-    return std::any_of(exemption_list.begin(), exemption_list.end(),
-        [&](const std::string& exempt) {
-            return name.find(exempt) != std::string::npos ||
-                   source_context.find(exempt) != std::string::npos;
-        });
-}
-
 // This returns one of the enum of PROP_SUCCESS or PROP_ERROR*.
 uint32_t CheckPermissions(const std::string& name, const std::string& value,
                           const std::string& source_context, const ucred& cr, std::string* error) {
@@ -539,7 +525,7 @@ uint32_t CheckPermissions(const std::string& name, const std::string& value,
     const char* type = nullptr;
     property_info_area->GetPropertyInfo(name.c_str(), &target_context, &type);
 
-    if (!is_exempt(name, source_context) && !CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
+    if (!CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
         // Info about contexts are available also in the selinux denials in the kernel message,
         // but they may be suppressed by the ratelimiter, in which case this log from init can be
         // helpful.
