@@ -404,9 +404,8 @@ static std::optional<uint32_t> PropertySet(const std::string& name, const std::s
     } else {
         prop_info* pi = (prop_info*)__system_property_find(name.c_str());
         if (pi != nullptr) {
-            // ro.* properties are actually "write-once", unless the system decides to
-            if (StartsWith(name, "ro.") && !weaken_prop_override_security &&
-                    !StartsWith(name, "ro.boot.vbmeta.")) {
+            // ro.* properties are actually "write-once", unless init is overriding them.
+            if (StartsWith(name, "ro.") && !weaken_prop_override_security) {
                 *error = "Read-only property was already set";
                 return {PROP_ERROR_READ_ONLY_PROPERTY};
             }
@@ -503,20 +502,6 @@ bool CheckControlPropertyPerms(const std::string& name, const std::string& value
     return CheckMacPerms(control_string_full, target_context_full, source_context.c_str(), cr);
 }
 
-static bool is_exempt(const std::string& name, const std::string& source_context) {
-    static const std::vector<std::string> exemption_list = {
-        "persist.sys.",
-        "logpersistd",
-        "ro.boot.vbmeta.",
-    };
-
-    return std::any_of(exemption_list.begin(), exemption_list.end(),
-        [&](const std::string& exempt) {
-            return name.find(exempt) != std::string::npos ||
-                   source_context.find(exempt) != std::string::npos;
-        });
-}
-
 // This returns one of the enum of PROP_SUCCESS or PROP_ERROR*.
 uint32_t CheckPermissions(const std::string& name, const std::string& value,
                           const std::string& source_context, const ucred& cr, std::string* error) {
@@ -539,7 +524,7 @@ uint32_t CheckPermissions(const std::string& name, const std::string& value,
     const char* type = nullptr;
     property_info_area->GetPropertyInfo(name.c_str(), &target_context, &type);
 
-    if (!is_exempt(name, source_context) && !CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
+    if (!CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
         // Info about contexts are available also in the selinux denials in the kernel message,
         // but they may be suppressed by the ratelimiter, in which case this log from init can be
         // helpful.
@@ -874,11 +859,6 @@ static void LoadPropertiesFromSecondStageRes(std::map<std::string, std::string>*
 // So we need to apply the same rule of build/make/tools/post_process_props.py
 // on runtime.
 static void update_sys_usb_config() {
-    // emulators don't have USB, they enable adb another way.
-    const char* DEBUG_PROP = "persist.sys.debug_enabled";
-    std::string debug_value = GetProperty(DEBUG_PROP, "0");
-    bool debug_enabled = debug_value == "1";
-
     const bool add_adb_func = !android::base::GetBoolProperty("ro.adb.secure", true) &&
                               android::base::GetBoolProperty("ro.adb.has_usb", true);
 
@@ -886,9 +866,8 @@ static void update_sys_usb_config() {
     // b/150130503, add (config == "none") condition here to prevent appending
     // ",adb" if "none" is explicitly defined in default prop.
     if (config.empty() || config == "none") {
-        InitPropertySet("persist.sys.usb.config",
-                        (add_adb_func || debug_enabled) ? "adb" : "none");
-    } else if ((add_adb_func || debug_enabled) && config.find("adb") == std::string::npos &&
+        InitPropertySet("persist.sys.usb.config", add_adb_func ? "adb" : "none");
+    } else if (add_adb_func && config.find("adb") == std::string::npos &&
                config.length() + 4 < PROP_VALUE_MAX) {
         config.append(",adb");
         InitPropertySet("persist.sys.usb.config", config);
@@ -1309,33 +1288,6 @@ void LoadVbMetaOverrides() {
     }
 }
 
-void LoadDebugProperties() {
-    const char* DEBUG_PROP = "persist.sys.debug_enabled";
-    std::string error;
-    uint32_t res;
-
-    std::string debug_value = GetProperty(DEBUG_PROP, "0");
-    bool debug_enabled = debug_value == "1";
-    LOG(INFO) << DEBUG_PROP << " = " << debug_value;
-
-    const std::pair<const char*, const char*> debug_props[] = {
-        {"service.adb.root", debug_enabled ? "1" : "0"},
-        {"ro.adb.secure", debug_enabled ? "0" : "1"},
-        {"ro.debuggable", debug_enabled ? "1" : "0"},
-        {"ro.force.debuggable", debug_enabled ? "1" : "0"}
-    };
-
-    for (const auto& [name, value] : debug_props) {
-        res = PropertySetNoSocket(name, value, &error);
-        if (res == PROP_SUCCESS) {
-            LOG(INFO) << "Debug property '" << name << "' set to '" << value << "'";
-        } else {
-            LOG(ERROR) << "Failed to set debug property '" << name
-                       << "' to '" << value << "': err=" << res << " (" << error << ")";
-        }
-    }
-}
-
 void LoadReleaseBuildProperties() {
     std::string error;
     uint32_t res;
@@ -1726,7 +1678,6 @@ static void HandleInitSocket() {
             }
             weaken_prop_override_security = true;
 
-            LoadDebugProperties();
             LoadVbMetaOverrides();
 
             weaken_prop_override_security = false;
