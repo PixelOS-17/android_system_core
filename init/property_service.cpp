@@ -78,10 +78,6 @@
 #include "util.h"
 #include "vendor_init.h"
 
-#include <sys/ioctl.h>
-#include <linux/fs.h>
-#include <functional>
-
 [[maybe_unused]] static constexpr char APPCOMPAT_OVERRIDE_PROP_FOLDERNAME[] =
         "/dev/__properties__/appcompat_override";
 [[maybe_unused]] static constexpr char APPCOMPAT_OVERRIDE_PROP_TREE_FILE[] =
@@ -1168,27 +1164,6 @@ static void OverrideProperty(const std::string& name, const std::string& value) 
     }
 }
 
-static std::string GetVbmetaSize() {
-    std::string path = "/dev/block/by-name/vbmeta" +
-                       android::base::GetProperty("ro.boot.slot_suffix", "");
-    android::base::unique_fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
-    if (fd < 0) {
-        PLOG(ERROR) << "Failed to open " << path;
-        return "";
-    }
-
-    uint64_t size = 0;
-    if (ioctl(fd.get(), BLKGETSIZE64, &size) < 0) {
-        off_t seek_size = lseek(fd.get(), 0, SEEK_END);
-        if (seek_size < 0) {
-            PLOG(ERROR) << "Failed to get size of " << path;
-            return "";
-        }
-        size = static_cast<uint64_t>(seek_size);
-    }
-    return std::to_string(size);
-}
-
 static void SetSafetyNetProps() {
     static const std::pair<const char*, const char*> props[] = {
         {"ro.boot.flash.locked", "1"},
@@ -1233,36 +1208,6 @@ static void SetSafetyNetProps() {
 
     for (const auto& [name, value] : props) {
         OverrideProperty(name, value);
-    }
-}
-
-static std::string GenerateFallbackDigest() {
-    std::string seed = android::base::GetProperty("ro.build.id", "unknown") + "-" +
-                       android::base::GetProperty("ro.build.version.incremental", "unknown") +
-                       "-vbmeta";
-
-    std::string result;
-    std::hash<std::string> hasher;
-    for (int i = 0; i < 8; i++) {
-        uint32_t h = static_cast<uint32_t>(hasher(seed + std::to_string(i)));
-        char buf[9];
-        snprintf(buf, sizeof(buf), "%08x", h);
-        result += buf;
-    }
-    return result;
-}
-
-static void LoadVbMetaOverrides() {
-    if (android::base::GetProperty("ro.boot.vbmeta.size", "").empty()) {
-        std::string vbmeta_size = GetVbmetaSize();
-        if (vbmeta_size.empty()) {
-            vbmeta_size = "4096";
-        }
-        OverrideProperty("ro.boot.vbmeta.size", vbmeta_size);
-    }
-
-    if (android::base::GetProperty("ro.boot.vbmeta.digest", "").empty()) {
-        OverrideProperty("ro.boot.vbmeta.digest", GenerateFallbackDigest());
     }
 }
 
@@ -1640,7 +1585,6 @@ static void HandleInitSocket() {
             weaken_prop_override_security = true;
 
             LoadDebugProperties();
-            LoadVbMetaOverrides();
 
             weaken_prop_override_security = false;
 
