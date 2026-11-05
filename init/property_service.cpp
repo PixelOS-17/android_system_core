@@ -17,12 +17,14 @@
 #include "property_service.h"
 
 #include <android/api-level.h>
+#include <algorithm>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <sstream>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -76,6 +78,10 @@
 #include "util.h"
 #include "vendor_init.h"
 
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <functional>
+
 [[maybe_unused]] static constexpr char APPCOMPAT_OVERRIDE_PROP_FOLDERNAME[] =
         "/dev/__properties__/appcompat_override";
 [[maybe_unused]] static constexpr char APPCOMPAT_OVERRIDE_PROP_TREE_FILE[] =
@@ -109,6 +115,7 @@ static bool persistent_properties_loaded = false;
 static int from_init_socket = -1;
 static int init_socket = -1;
 static bool accept_messages = false;
+static bool weaken_prop_override_security = false;
 [[clang::no_destroy]] static std::mutex accept_messages_lock;
 [[clang::no_destroy]] static std::mutex selinux_check_access_lock;
 [[clang::no_destroy]] static std::thread property_service_thread;
@@ -397,8 +404,9 @@ static std::optional<uint32_t> PropertySet(const std::string& name, const std::s
     } else {
         prop_info* pi = (prop_info*)__system_property_find(name.c_str());
         if (pi != nullptr) {
-            // ro.* properties are actually "write-once".
-            if (StartsWith(name, "ro.")) {
+            // ro.* properties are actually "write-once", unless init is overriding them
+            if (StartsWith(name, "ro.") && !StartsWith(name, "ro.appcompat_override.") &&
+                !weaken_prop_override_security) {
                 *error = "Read-only property was already set";
                 return {PROP_ERROR_READ_ONLY_PROPERTY};
             }
@@ -853,6 +861,10 @@ static void LoadPropertiesFromSecondStageRes(std::map<std::string, std::string>*
 // on runtime.
 static void update_sys_usb_config() {
     // emulators don't have USB, they enable adb another way.
+    const char* DEBUG_PROP = "persist.sys.debug_enabled";
+    std::string debug_value = GetProperty(DEBUG_PROP, "0");
+    bool debug_enabled = debug_value == "1";
+
     const bool add_adb_func = !android::base::GetBoolProperty("ro.adb.secure", true) &&
                               android::base::GetBoolProperty("ro.adb.has_usb", true);
 
@@ -860,8 +872,9 @@ static void update_sys_usb_config() {
     // b/150130503, add (config == "none") condition here to prevent appending
     // ",adb" if "none" is explicitly defined in default prop.
     if (config.empty() || config == "none") {
-        InitPropertySet("persist.sys.usb.config", add_adb_func ? "adb" : "none");
-    } else if (add_adb_func && config.find("adb") == std::string::npos &&
+        InitPropertySet("persist.sys.usb.config",
+                        (add_adb_func || debug_enabled) ? "adb" : "none");
+    } else if ((add_adb_func || debug_enabled) && config.find("adb") == std::string::npos &&
                config.length() + 4 < PROP_VALUE_MAX) {
         config.append(",adb");
         InitPropertySet("persist.sys.usb.config", config);
@@ -1146,6 +1159,151 @@ static void property_initialize_ro_vendor_api_level() {
     }
 }
 
+static void OverrideProperty(const std::string& name, const std::string& value) {
+    std::string error;
+    uint32_t res = PropertySetNoSocket(name, value, &error);
+    if (res != PROP_SUCCESS) {
+        LOG(ERROR) << "Failed to override " << name << " with '" << value << "': " << error
+                   << " (" << res << ")";
+    }
+}
+
+static std::string GetVbmetaSize() {
+    std::string path = "/dev/block/by-name/vbmeta" +
+                       android::base::GetProperty("ro.boot.slot_suffix", "");
+    android::base::unique_fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    if (fd < 0) {
+        PLOG(ERROR) << "Failed to open " << path;
+        return "";
+    }
+
+    uint64_t size = 0;
+    if (ioctl(fd.get(), BLKGETSIZE64, &size) < 0) {
+        off_t seek_size = lseek(fd.get(), 0, SEEK_END);
+        if (seek_size < 0) {
+            PLOG(ERROR) << "Failed to get size of " << path;
+            return "";
+        }
+        size = static_cast<uint64_t>(seek_size);
+    }
+    return std::to_string(size);
+}
+
+static void SetSafetyNetProps() {
+    static const std::pair<const char*, const char*> props[] = {
+        {"ro.boot.flash.locked", "1"},
+        {"ro.boot.vbmeta.device_state", "locked"},
+        {"ro.boot.vbmeta.hash_alg", "sha256"},
+        {"ro.boot.vbmeta.avb_version", "1.0"},
+        {"ro.boot.vbmeta.invalidate_on_error", "yes"},
+        {"ro.boot.verifiedbootstate", "green"},
+        {"ro.boot.veritymode", "enforcing"},
+        {"ro.boot.warranty_bit", "0"},
+        {"ro.warranty_bit", "0"},
+        {"ro.debuggable", "0"},
+        {"ro.force.debuggable", "0"},
+        {"ro.adb.secure", "1"},
+        {"ro.secure", "1"},
+        {"ro.bootimage.build.type", "user"},
+        {"ro.build.type", "user"},
+        {"ro.build.keys", "release-keys"},
+        {"ro.build.tags", "release-keys"},
+        {"ro.system.build.tags", "release-keys"},
+        {"ro.product.build.type", "user"},
+        {"ro.system_dlkm.build.type", "user"},
+        {"ro.odm.build.type", "user"},
+        {"ro.system.build.type", "user"},
+        {"ro.system_ext.build.type", "user"},
+        {"ro.vendor.build.type", "user"},
+        {"ro.vendor_dlkm.build.type", "user"},
+        {"ro.vendor.boot.warranty_bit", "0"},
+        {"ro.vendor.warranty_bit", "0"},
+        {"vendor.boot.vbmeta.device_state", "locked"},
+        {"vendor.boot.verifiedbootstate", "green"},
+        {"oplusboot.verifiedbootstate", "green"},
+        {"ro.oem_unlock_supported", "0"},
+        {"ro.crypto.state", "encrypted"},
+        {"ro.is_ever_orange", "0"},
+        {"ro.secureboot.devicelock", "1"},
+        {"ro.secureboot.lockstate", "locked"},
+#ifdef SPOOF_FIRST_API_LEVEL_32
+        {"ro.product.first_api_level", "32"},
+#endif
+    };
+
+    for (const auto& [name, value] : props) {
+        OverrideProperty(name, value);
+    }
+}
+
+static std::string GenerateFallbackDigest() {
+    std::string seed = android::base::GetProperty("ro.build.id", "unknown") + "-" +
+                       android::base::GetProperty("ro.build.version.incremental", "unknown") +
+                       "-vbmeta";
+
+    std::string result;
+    std::hash<std::string> hasher;
+    for (int i = 0; i < 8; i++) {
+        uint32_t h = static_cast<uint32_t>(hasher(seed + std::to_string(i)));
+        char buf[9];
+        snprintf(buf, sizeof(buf), "%08x", h);
+        result += buf;
+    }
+    return result;
+}
+
+static void LoadVbMetaOverrides() {
+    if (android::base::GetProperty("ro.boot.vbmeta.size", "").empty()) {
+        std::string vbmeta_size = GetVbmetaSize();
+        if (vbmeta_size.empty()) {
+            vbmeta_size = "4096";
+        }
+        OverrideProperty("ro.boot.vbmeta.size", vbmeta_size);
+    }
+
+    if (android::base::GetProperty("ro.boot.vbmeta.digest", "").empty()) {
+        OverrideProperty("ro.boot.vbmeta.digest", GenerateFallbackDigest());
+    }
+}
+
+static void LoadDebugProperties() {
+    const bool debug_enabled = android::base::GetBoolProperty("persist.sys.debug_enabled", false);
+    if (debug_enabled) {
+        LOG(INFO) << "persist.sys.debug_enabled is set, enabling adb root";
+    }
+
+    OverrideProperty("service.adb.root", debug_enabled ? "1" : "0");
+    OverrideProperty("ro.debuggable", debug_enabled ? "1" : "0");
+    OverrideProperty("ro.force.debuggable", debug_enabled ? "1" : "0");
+}
+
+static void LoadReleaseBuildProperties() {
+    std::string flavor = android::base::GetProperty("ro.build.flavor", "");
+    if (!flavor.empty()) {
+        for (const char* prefix : {"lineage_", "pixelos_"}) {
+            if (StartsWith(flavor, prefix)) {
+                flavor.erase(0, strlen(prefix));
+                break;
+            }
+        }
+        size_t pos = flavor.find("userdebug");
+        if (pos != std::string::npos) {
+            flavor.replace(pos, std::string("userdebug").length(), "user");
+        }
+        OverrideProperty("ro.build.flavor", flavor);
+    }
+
+    std::istringstream display_id(android::base::GetProperty("ro.build.display.id", ""));
+    std::string token;
+    while (display_id >> token) {
+        if (token.find('.') != std::string::npos &&
+            std::any_of(token.begin(), token.end(), ::isdigit)) {
+            OverrideProperty("ro.build.display.id", token);
+            break;
+        }
+    }
+}
+
 void PropertyLoadBootDefaults() {
     // We read the properties and their values into a map, in order to always allow properties
     // loaded in the later property files to override the properties in loaded in the earlier
@@ -1240,6 +1398,10 @@ void PropertyLoadBootDefaults() {
         }
     }
 
+    // ro.* is write-once. The kernel cmdline has already set the boot properties,
+    // so the overrides below have to run while that restriction is lifted.
+    weaken_prop_override_security = true;
+
     // Update with vendor-specific property runtime overrides
     vendor_load_properties();
 
@@ -1247,6 +1409,16 @@ void PropertyLoadBootDefaults() {
     property_derive_build_fingerprint();
     property_initialize_ro_cpu_abilist();
     property_initialize_ro_vendor_api_level();
+
+    if (SPOOF_SAFETYNET) {
+      if (!IsRecoveryMode()) {
+        SetSafetyNetProps();
+      }
+    }
+
+    LoadReleaseBuildProperties();
+
+    weaken_prop_override_security = false;
 
     update_sys_usb_config();
 }
@@ -1465,6 +1637,13 @@ static void HandleInitSocket() {
                 // Always enable usb adb if device is booted with debug ramdisk.
                 update_sys_usb_config();
             }
+            weaken_prop_override_security = true;
+
+            LoadDebugProperties();
+            LoadVbMetaOverrides();
+
+            weaken_prop_override_security = false;
+
             InitPropertySet("ro.persistent_properties.ready", "true");
             persistent_properties_loaded = true;
             break;
